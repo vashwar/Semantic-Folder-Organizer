@@ -1,0 +1,28 @@
+Act as an expert Python developer and AI architect. I want to build a local CLI application that uses the Gemini API to organize folders on my machine based on the actual semantic content of the files.
+
+The architecture must be decoupled into two files using the Model Context Protocol (MCP):
+1. `file_server.py`: A FastMCP server that acts as the "hands."
+2. `cli_agent.py`: A LangChain orchestrator that acts as the "brain."
+
+**CRITICAL RULE:** Do not create any dummy files, mock data, or hardcoded test directories. The system must take the target folder path directly from the user via the terminal at runtime. 
+
+### **Part 1: The MCP Server (`file_server.py`)**
+Use the `mcp.server.fastmcp` library to build a server named "SemanticFileOrganizer". It must expose two tools:
+
+* `@mcp.tool() scan_folder(folder_path: str) -> str`: Uses `pathlib` to scan the provided directory. It should return a formatted string listing file names and sizes. 
+    * **Crucial Content Extraction:** For `.txt` and `.csv` files, open and read the first 1000 characters. For `.pdf` files, use the `pypdf` library to extract the text from the first page (up to 1000 characters). Append this "Content Preview" to the file's description in the returned string so the LLM understands the semantic context of the file. Handle encoding errors gracefully. Do not attempt to read `.xlsx` files; expect `.csv`.
+* `@mcp.tool() organize_files(move_plan: list[dict]) -> str`: Takes a JSON array of dictionaries containing `source` and `dest` absolute paths. It must iterate through the plan and use `shutil.move` to physically move the files. It must use `dest_path.parent.mkdir(parents=True, exist_ok=True)` to safely create any new categorical subfolders proposed by the LLM before attempting to move the file. Return a success/error log.
+
+### **Part 2: The CLI Orchestrator (`cli_agent.py`)**
+Use `langchain`, `langchain_mcp_adapters`, and the `langchain-google-genai` package to initialize `ChatGoogleGenerativeAI`. Use the `gemini-2.5-flash` model. Ensure it loads my `GOOGLE_API_KEY` securely from the environment.
+
+**The Execution Loop:**
+1. Prompt the user via `input()` to provide the absolute path to the folder they want to organize.
+2. Initialize the LangChain Agent and connect it to `file_server.py` using `stdio` transport. 
+3. Instruct the Agent to invoke the `scan_folder` tool on the user's path.
+4. The Agent must analyze the file metadata AND the extracted content snippets to perform deep semantic categorization. It should print a proposed organization plan to the terminal, explaining *why* it grouped certain files together based on their content.
+5. **Human-in-the-loop:** The script must pause and use `input()` to ask for user feedback. 
+    * If the user types "Approve" (or similar), the Agent must format its plan into the strict JSON required and execute the `organize_files` tool.
+    * If the user provides feedback, the Agent must revise its plan, print the new proposal, and pause for approval again.
+
+Please generate the complete, production-ready code for both `file_server.py` and `cli_agent.py`. Ensure robust error handling is in place so the CLI does not crash if the model hallucinates invalid JSON or if a file is unreadable.

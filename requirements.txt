@@ -1,0 +1,7 @@
+mcp[cli]
+langchain
+langchain-mcp-adapters
+langchain-google-genai
+langgraph
+pypdf
+python-dotenv
