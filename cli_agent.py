@@ -14,6 +14,8 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain.agents import create_agent
 
 
+BATCH_SIZE = 200
+
 SYSTEM_PROMPT = """You are a semantic file organizer. Your job is to analyze files in a folder
 and propose an organization plan based on the actual content and meaning of the files.
 
@@ -140,6 +142,106 @@ def strip_json_block(text: str) -> str:
     return output
 
 
+def merge_category_maps(maps: list[dict[str, list[str]]]) -> dict[str, list[str]]:
+    """Merge multiple category maps into one, combining file lists for matching categories."""
+    merged: dict[str, list[str]] = {}
+    for m in maps:
+        for category, filenames in m.items():
+            if category in merged:
+                merged[category].extend(filenames)
+            else:
+                merged[category] = list(filenames)
+    return merged
+
+
+def _build_batch_prompt(file_data: str, existing_categories: list[str] | None = None) -> str:
+    """Build the prompt sent to the LLM for a single batch."""
+    prompt = (
+        "You are a semantic file organizer. Analyze the following files and categorize them "
+        "by their actual content, meaning, or purpose (not just file extension).\n\n"
+    )
+    if existing_categories:
+        prompt += (
+            "IMPORTANT: Previous batches have already established these categories:\n"
+            + ", ".join(f'"{c}"' for c in existing_categories)
+            + "\nReuse these category names when files fit. Only create a new category "
+            "if a file truly doesn't belong in any existing one.\n\n"
+        )
+    prompt += (
+        f"{file_data}\n\n"
+        "Output ONLY a JSON object mapping category folder names to arrays of filenames. "
+        "Use EXACT filenames from the listing above. Every file must appear in exactly one category. "
+        "No explanation, no markdown fences — just the raw JSON object."
+    )
+    return prompt
+
+
+async def process_large_folder(
+    llm,
+    scan_tool,
+    organize_tool,
+    folder_path: str,
+    total_files: int,
+) -> tuple[dict[str, list[str]] | None, list[dict] | None]:
+    """Process a large folder in batches, returning (category_map, move_plan) or (None, None)."""
+    import math
+
+    num_batches = math.ceil(total_files / BATCH_SIZE)
+    print(f"\nLarge folder detected ({total_files} files). Processing in {num_batches} batches of {BATCH_SIZE}...\n")
+
+    all_maps: list[dict[str, list[str]]] = []
+    all_categories: list[str] = []
+
+    for batch_idx in range(num_batches):
+        offset = batch_idx * BATCH_SIZE
+        end = min(offset + BATCH_SIZE, total_files)
+        print(f"[Batch {batch_idx + 1}/{num_batches}: processing files {offset + 1}-{end}...]")
+
+        # Get this batch's file data via MCP tool
+        scan_result = await scan_tool.ainvoke({
+            "folder_path": folder_path,
+            "offset": str(offset),
+            "limit": str(BATCH_SIZE),
+        })
+
+        # Build prompt and call LLM directly (no agent overhead)
+        prompt = _build_batch_prompt(scan_result, all_categories if all_categories else None)
+        response = await llm.ainvoke(prompt)
+        response_text = response.content if hasattr(response, "content") else str(response)
+
+        # Extract category map from this batch
+        batch_map = extract_category_map(response_text)
+        if batch_map is None:
+            # Retry once asking for just JSON
+            retry_prompt = (
+                "Your previous response could not be parsed. Output ONLY a valid JSON object "
+                "mapping category names to arrays of filenames. No markdown, no explanation.\n\n"
+                f"Files to categorize:\n{scan_result}"
+            )
+            retry_response = await llm.ainvoke(retry_prompt)
+            retry_text = retry_response.content if hasattr(retry_response, "content") else str(retry_response)
+            batch_map = extract_category_map(retry_text)
+
+        if batch_map:
+            batch_file_count = sum(len(v) for v in batch_map.values())
+            print(f"  -> {batch_file_count} files into {len(batch_map)} categories")
+            all_maps.append(batch_map)
+            # Update known categories for priming the next batch
+            for cat in batch_map:
+                if cat not in all_categories:
+                    all_categories.append(cat)
+        else:
+            print(f"  -> WARNING: Could not extract categories for this batch. Skipping.")
+
+    if not all_maps:
+        return None, None
+
+    # Merge all batch maps
+    merged = merge_category_maps(all_maps)
+    plan = build_move_plan(folder_path, merged)
+    return merged, plan
+
+
 async def run_agent():
     api_key = os.environ.get("GOOGLE_API_KEY")
     if not api_key:
@@ -176,10 +278,11 @@ async def run_agent():
     )
     tools = await client.get_tools()
 
-    # Get reference to organize_files tool for direct invocation
+    # Get references to tools for direct invocation
     organize_tool = next((t for t in tools if t.name == "organize_files"), None)
-    if not organize_tool:
-        print("Error: organize_files tool not found on MCP server.")
+    scan_tool = next((t for t in tools if t.name == "scan_folder"), None)
+    if not organize_tool or not scan_tool:
+        print("Error: Required tools not found on MCP server.")
         sys.exit(1)
 
     llm = ChatGoogleGenerativeAI(
@@ -187,55 +290,92 @@ async def run_agent():
         google_api_key=api_key,
     )
 
-    agent = create_agent(llm, tools)
+    # Step 1: Quick scan to get total file count
+    print("Scanning folder...\n")
+    initial_scan = await scan_tool.ainvoke({
+        "folder_path": folder_path,
+        "offset": "0",
+        "limit": "1",
+    })
 
-    # Step 1: Scan the folder
-    print("Scanning folder and analyzing content...\n")
-    scan_message = (
-        f"Scan the folder at '{folder_path}' using the scan_folder tool, "
-        f"then analyze the files and propose an organization plan. "
-        f"At the end, include a ```json code block with a category mapping object "
-        f"(category names as keys, arrays of filenames as values)."
-    )
+    # Parse total file count from header: "... (showing X of Y total files):"
+    count_match = re.search(r'of (\d+) total files', initial_scan)
+    total_file_count = int(count_match.group(1)) if count_match else 0
 
-    response = await agent.ainvoke(
-        {"messages": [("system", SYSTEM_PROMPT), ("human", scan_message)]}
-    )
-
-    last_message = response["messages"][-1]
-    print("=" * 60)
-    print("PROPOSED ORGANIZATION PLAN")
-    print("=" * 60)
-    print(strip_json_block(last_message.content))
-    print("=" * 60)
-
-    # Extract category map and build move plan
-    category_map = extract_category_map(last_message.content)
+    category_map = None
     plan = None
-    if category_map:
-        plan = build_move_plan(folder_path, category_map)
-        total_files = sum(len(v) for v in category_map.values())
-        print(f"\n[Plan: {total_files} files into {len(category_map)} categories]")
-    else:
-        # Retry: ask the LLM for just the JSON
-        print("\n[Could not extract plan from response. Requesting structured output...]")
-        messages = response["messages"]
-        messages.append(
-            ("human", "Output ONLY the category mapping as a ```json code block. No explanation. Just the JSON object with category names as keys and filename arrays as values.")
+    agent = None
+    messages = []  # conversation history for feedback loop (small-folder path)
+
+    if total_file_count > BATCH_SIZE:
+        # Large folder: batch processing path
+        category_map, plan = await process_large_folder(
+            llm, scan_tool, organize_tool, folder_path, total_file_count
         )
-        retry_response = await agent.ainvoke({"messages": messages})
-        messages = retry_response["messages"]
-        last_message = messages[-1]
+        if category_map:
+            total_files = sum(len(v) for v in category_map.values())
+            print(f"\n{'=' * 60}")
+            print("PROPOSED ORGANIZATION PLAN")
+            print("=" * 60)
+            for cat, files in sorted(category_map.items()):
+                print(f"\n  {cat}/ ({len(files)} files)")
+                # Show first few filenames as a preview
+                for f in files[:5]:
+                    print(f"    - {f}")
+                if len(files) > 5:
+                    print(f"    ... and {len(files) - 5} more")
+            print(f"\n{'=' * 60}")
+            print(f"\n[Plan: {total_files} files into {len(category_map)} categories]")
+        else:
+            print("\n[Error: Could not generate a plan for this folder.]")
+    else:
+        # Small folder: existing single-pass agent flow
+        agent = create_agent(llm, tools)
+
+        print("Analyzing content...\n")
+        scan_message = (
+            f"Scan the folder at '{folder_path}' using the scan_folder tool, "
+            f"then analyze the files and propose an organization plan. "
+            f"At the end, include a ```json code block with a category mapping object "
+            f"(category names as keys, arrays of filenames as values)."
+        )
+
+        response = await agent.ainvoke(
+            {"messages": [("system", SYSTEM_PROMPT), ("human", scan_message)]}
+        )
+
+        last_message = response["messages"][-1]
+        print("=" * 60)
+        print("PROPOSED ORGANIZATION PLAN")
+        print("=" * 60)
+        print(strip_json_block(last_message.content))
+        print("=" * 60)
+
+        # Extract category map and build move plan
         category_map = extract_category_map(last_message.content)
         if category_map:
             plan = build_move_plan(folder_path, category_map)
             total_files = sum(len(v) for v in category_map.values())
-            print(f"[Plan: {total_files} files into {len(category_map)} categories]")
+            print(f"\n[Plan: {total_files} files into {len(category_map)} categories]")
         else:
-            print("[Warning: Could not extract category plan. Provide feedback to generate one.]")
+            # Retry: ask the LLM for just the JSON
+            print("\n[Could not extract plan from response. Requesting structured output...]")
+            messages = response["messages"]
+            messages.append(
+                ("human", "Output ONLY the category mapping as a ```json code block. No explanation. Just the JSON object with category names as keys and filename arrays as values.")
+            )
+            retry_response = await agent.ainvoke({"messages": messages})
+            messages = retry_response["messages"]
+            last_message = messages[-1]
+            category_map = extract_category_map(last_message.content)
+            if category_map:
+                plan = build_move_plan(folder_path, category_map)
+                total_files = sum(len(v) for v in category_map.values())
+                print(f"[Plan: {total_files} files into {len(category_map)} categories]")
+            else:
+                print("[Warning: Could not extract category plan. Provide feedback to generate one.]")
 
-    # Step 2: Human-in-the-loop feedback cycle
-    messages = response["messages"]
+        messages = response["messages"]
 
     while True:
         user_input = input(
@@ -268,48 +408,85 @@ async def run_agent():
             print("\nDone! Your files have been organized.")
             break
         else:
-            # User provided feedback — ask the agent to revise
-            messages.append(
-                ("human", (
-                    f"User feedback: \"{user_input}\"\n\n"
-                    f"Revise the plan. Include the COMPLETE updated category mapping "
-                    f"as a ```json code block at the end (category names → filename arrays)."
-                ))
-            )
+            # User provided feedback — revise the plan
             print("\nRevising plan based on your feedback...\n")
 
-            response = await agent.ainvoke({"messages": messages})
-            messages = response["messages"]
-            last_message = messages[-1]
-
-            print("=" * 60)
-            print("REVISED ORGANIZATION PLAN")
-            print("=" * 60)
-            print(strip_json_block(last_message.content))
-            print("=" * 60)
-
-            new_map = extract_category_map(last_message.content)
-            if new_map:
-                category_map = new_map
-                plan = build_move_plan(folder_path, category_map)
-                total_files = sum(len(v) for v in category_map.values())
-                print(f"\n[Updated plan: {total_files} files into {len(category_map)} categories]")
-            else:
-                # Retry: ask for just the JSON
-                print("[Requesting category mapping from agent...]")
-                messages.append(
-                    ("human", "Output ONLY the category mapping as a ```json code block. No explanation. Just the JSON object with category names as keys and filename arrays as values.")
+            if total_file_count > BATCH_SIZE:
+                # Large folder: send current category map + feedback to LLM directly
+                revision_prompt = (
+                    "You are a semantic file organizer. Here is the current category mapping "
+                    "for a folder:\n\n"
+                    f"```json\n{json.dumps(category_map, indent=2)}\n```\n\n"
+                    f"User feedback: \"{user_input}\"\n\n"
+                    "Revise the mapping based on this feedback. Output ONLY the complete "
+                    "updated JSON object (category names as keys, filename arrays as values). "
+                    "Include ALL files — not just the changed ones. No explanation, no markdown fences."
                 )
-                retry_response = await agent.ainvoke({"messages": messages})
-                messages = retry_response["messages"]
-                new_map = extract_category_map(messages[-1].content)
+                revision_response = await llm.ainvoke(revision_prompt)
+                revision_text = revision_response.content if hasattr(revision_response, "content") else str(revision_response)
+
+                new_map = extract_category_map(revision_text)
                 if new_map:
                     category_map = new_map
                     plan = build_move_plan(folder_path, category_map)
                     total_files = sum(len(v) for v in category_map.values())
-                    print(f"[Updated plan: {total_files} files into {len(category_map)} categories]")
+                    print("=" * 60)
+                    print("REVISED ORGANIZATION PLAN")
+                    print("=" * 60)
+                    for cat, files in sorted(category_map.items()):
+                        print(f"\n  {cat}/ ({len(files)} files)")
+                        for f in files[:5]:
+                            print(f"    - {f}")
+                        if len(files) > 5:
+                            print(f"    ... and {len(files) - 5} more")
+                    print(f"\n{'=' * 60}")
+                    print(f"\n[Updated plan: {total_files} files into {len(category_map)} categories]")
                 else:
-                    print("[Warning: Could not extract plan. Previous plan is still active if available.]")
+                    print("[Warning: Could not extract revised plan. Previous plan is still active if available.]")
+            else:
+                # Small folder: use the agent with full conversation history
+                if agent is None:
+                    agent = create_agent(llm, tools)
+                messages.append(
+                    ("human", (
+                        f"User feedback: \"{user_input}\"\n\n"
+                        f"Revise the plan. Include the COMPLETE updated category mapping "
+                        f"as a ```json code block at the end (category names → filename arrays)."
+                    ))
+                )
+
+                response = await agent.ainvoke({"messages": messages})
+                messages = response["messages"]
+                last_message = messages[-1]
+
+                print("=" * 60)
+                print("REVISED ORGANIZATION PLAN")
+                print("=" * 60)
+                print(strip_json_block(last_message.content))
+                print("=" * 60)
+
+                new_map = extract_category_map(last_message.content)
+                if new_map:
+                    category_map = new_map
+                    plan = build_move_plan(folder_path, category_map)
+                    total_files = sum(len(v) for v in category_map.values())
+                    print(f"\n[Updated plan: {total_files} files into {len(category_map)} categories]")
+                else:
+                    # Retry: ask for just the JSON
+                    print("[Requesting category mapping from agent...]")
+                    messages.append(
+                        ("human", "Output ONLY the category mapping as a ```json code block. No explanation. Just the JSON object with category names as keys and filename arrays as values.")
+                    )
+                    retry_response = await agent.ainvoke({"messages": messages})
+                    messages = retry_response["messages"]
+                    new_map = extract_category_map(messages[-1].content)
+                    if new_map:
+                        category_map = new_map
+                        plan = build_move_plan(folder_path, category_map)
+                        total_files = sum(len(v) for v in category_map.values())
+                        print(f"[Updated plan: {total_files} files into {len(category_map)} categories]")
+                    else:
+                        print("[Warning: Could not extract plan. Previous plan is still active if available.]")
 
 
 def main():

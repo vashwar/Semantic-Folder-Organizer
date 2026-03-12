@@ -31,8 +31,14 @@ def _read_pdf_preview(file_path: Path, max_chars: int = 1000) -> str:
 
 
 @mcp.tool()
-def scan_folder(folder_path: str) -> str:
-    """Scan a folder and return file names, sizes, and content previews for supported types."""
+def scan_folder(folder_path: str, offset: int = 0, limit: int = 0) -> str:
+    """Scan a folder and return file names, sizes, and content previews for supported types.
+
+    Args:
+        folder_path: Absolute path to the folder to scan.
+        offset: Number of files to skip from the beginning (default 0).
+        limit: Maximum number of files to return. 0 means return all files.
+    """
     path = Path(folder_path)
 
     if not path.exists():
@@ -40,13 +46,18 @@ def scan_folder(folder_path: str) -> str:
     if not path.is_dir():
         return f"Error: The path '{folder_path}' is not a directory."
 
-    files = [f for f in path.iterdir() if f.is_file()]
+    files = sorted(f for f in path.iterdir() if f.is_file())
+    total_count = len(files)
 
-    if not files:
+    if total_count == 0:
         return f"The folder '{folder_path}' contains no files."
 
+    # Apply offset/limit slicing
+    if limit > 0:
+        files = files[offset : offset + limit]
+
     results = []
-    for file in sorted(files):
+    for file in files:
         size_bytes = file.stat().st_size
         if size_bytes < 1024:
             size_str = f"{size_bytes} B"
@@ -67,7 +78,7 @@ def scan_folder(folder_path: str) -> str:
 
         results.append(entry)
 
-    header = f"Files in '{folder_path}' ({len(files)} files):\n"
+    header = f"Files in '{folder_path}' (showing {len(files)} of {total_count} total files):\n"
     return header + "\n".join(results)
 
 
