@@ -154,6 +154,18 @@ def _tool_result_to_str(result) -> str:
     return str(result)
 
 
+def ensure_all_files_categorized(folder_path: str, category_map: dict[str, list[str]]) -> dict[str, list[str]]:
+    """Check for files in the folder not present in the category map and add them to 'Other'."""
+    actual_files = {f.name for f in Path(folder_path).iterdir() if f.is_file()}
+    categorized = {fn for fns in category_map.values() for fn in fns}
+    missing = actual_files - categorized
+    if missing:
+        other = category_map.get("Other", [])
+        other.extend(sorted(missing))
+        category_map["Other"] = other
+    return category_map
+
+
 def merge_category_maps(maps: list[dict[str, list[str]]]) -> dict[str, list[str]]:
     """Merge multiple category maps into one, combining file lists for matching categories."""
     merged: dict[str, list[str]] = {}
@@ -248,8 +260,9 @@ async def process_large_folder(
     if not all_maps:
         return None, None
 
-    # Merge all batch maps
+    # Merge all batch maps and catch any files the LLM missed
     merged = merge_category_maps(all_maps)
+    merged = ensure_all_files_categorized(folder_path, merged)
     plan = build_move_plan(folder_path, merged)
     return merged, plan
 
@@ -366,6 +379,7 @@ async def run_agent():
         # Extract category map and build move plan
         category_map = extract_category_map(last_message.content)
         if category_map:
+            category_map = ensure_all_files_categorized(folder_path, category_map)
             plan = build_move_plan(folder_path, category_map)
             total_files = sum(len(v) for v in category_map.values())
             print(f"\n[Plan: {total_files} files into {len(category_map)} categories]")
@@ -381,6 +395,7 @@ async def run_agent():
             last_message = messages[-1]
             category_map = extract_category_map(last_message.content)
             if category_map:
+                category_map = ensure_all_files_categorized(folder_path, category_map)
                 plan = build_move_plan(folder_path, category_map)
                 total_files = sum(len(v) for v in category_map.values())
                 print(f"[Plan: {total_files} files into {len(category_map)} categories]")
@@ -439,7 +454,7 @@ async def run_agent():
 
                 new_map = extract_category_map(revision_text)
                 if new_map:
-                    category_map = new_map
+                    category_map = ensure_all_files_categorized(folder_path, new_map)
                     plan = build_move_plan(folder_path, category_map)
                     total_files = sum(len(v) for v in category_map.values())
                     print("=" * 60)
@@ -479,7 +494,7 @@ async def run_agent():
 
                 new_map = extract_category_map(last_message.content)
                 if new_map:
-                    category_map = new_map
+                    category_map = ensure_all_files_categorized(folder_path, new_map)
                     plan = build_move_plan(folder_path, category_map)
                     total_files = sum(len(v) for v in category_map.values())
                     print(f"\n[Updated plan: {total_files} files into {len(category_map)} categories]")
@@ -493,7 +508,7 @@ async def run_agent():
                     messages = retry_response["messages"]
                     new_map = extract_category_map(messages[-1].content)
                     if new_map:
-                        category_map = new_map
+                        category_map = ensure_all_files_categorized(folder_path, new_map)
                         plan = build_move_plan(folder_path, category_map)
                         total_files = sum(len(v) for v in category_map.values())
                         print(f"[Updated plan: {total_files} files into {len(category_map)} categories]")
