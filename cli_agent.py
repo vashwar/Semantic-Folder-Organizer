@@ -217,7 +217,22 @@ async def run_agent():
         total_files = sum(len(v) for v in category_map.values())
         print(f"\n[Plan: {total_files} files into {len(category_map)} categories]")
     else:
-        print("\n[Warning: Could not extract category plan from response]")
+        # Retry: ask the LLM for just the JSON
+        print("\n[Could not extract plan from response. Requesting structured output...]")
+        messages = response["messages"]
+        messages.append(
+            ("human", "Output ONLY the category mapping as a ```json code block. No explanation. Just the JSON object with category names as keys and filename arrays as values.")
+        )
+        retry_response = await agent.ainvoke({"messages": messages})
+        messages = retry_response["messages"]
+        last_message = messages[-1]
+        category_map = extract_category_map(last_message.content)
+        if category_map:
+            plan = build_move_plan(folder_path, category_map)
+            total_files = sum(len(v) for v in category_map.values())
+            print(f"[Plan: {total_files} files into {len(category_map)} categories]")
+        else:
+            print("[Warning: Could not extract category plan. Provide feedback to generate one.]")
 
     # Step 2: Human-in-the-loop feedback cycle
     messages = response["messages"]
