@@ -142,6 +142,18 @@ def strip_json_block(text: str) -> str:
     return output
 
 
+def _tool_result_to_str(result) -> str:
+    """Convert an MCP tool result to a plain string (handles list-of-content-blocks)."""
+    if isinstance(result, str):
+        return result
+    if isinstance(result, list):
+        return "\n".join(
+            item.get("text", str(item)) if isinstance(item, dict) else str(item)
+            for item in result
+        )
+    return str(result)
+
+
 def merge_category_maps(maps: list[dict[str, list[str]]]) -> dict[str, list[str]]:
     """Merge multiple category maps into one, combining file lists for matching categories."""
     merged: dict[str, list[str]] = {}
@@ -198,11 +210,11 @@ async def process_large_folder(
         print(f"[Batch {batch_idx + 1}/{num_batches}: processing files {offset + 1}-{end}...]")
 
         # Get this batch's file data via MCP tool
-        scan_result = await scan_tool.ainvoke({
+        scan_result = _tool_result_to_str(await scan_tool.ainvoke({
             "folder_path": folder_path,
             "offset": str(offset),
             "limit": str(BATCH_SIZE),
-        })
+        }))
 
         # Build prompt and call LLM directly (no agent overhead)
         prompt = _build_batch_prompt(scan_result, all_categories if all_categories else None)
@@ -292,11 +304,11 @@ async def run_agent():
 
     # Step 1: Quick scan to get total file count
     print("Scanning folder...\n")
-    initial_scan = await scan_tool.ainvoke({
+    initial_scan = _tool_result_to_str(await scan_tool.ainvoke({
         "folder_path": folder_path,
         "offset": "0",
         "limit": "1",
-    })
+    }))
 
     # Parse total file count from header: "... (showing X of Y total files):"
     count_match = re.search(r'of (\d+) total files', initial_scan)
