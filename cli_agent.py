@@ -432,6 +432,62 @@ async def run_agent():
             print("=" * 60)
             print(result)
             print("=" * 60)
+
+            # Post-move sweep: check for leftover files at top level
+            leftover = [f.name for f in Path(folder_path).iterdir() if f.is_file()]
+            if leftover:
+                existing_cats = [
+                    d.name for d in Path(folder_path).iterdir()
+                    if d.is_dir()
+                ]
+                print(f"\n[Sweep: {len(leftover)} file(s) still at top level. Categorizing...]")
+                sweep_prompt = (
+                    "You are a semantic file organizer. The following files were left "
+                    "uncategorized after an organization pass. Assign each one to the "
+                    "BEST-FIT existing category.\n\n"
+                    f"Existing categories: {', '.join(existing_cats)}\n\n"
+                    f"Leftover files:\n"
+                    + "\n".join(f"- {f}" for f in leftover)
+                    + "\n\nOutput ONLY a JSON object mapping category names to arrays "
+                    "of filenames. Use ONLY the existing category names listed above. "
+                    "Every file must appear in exactly one category. "
+                    "No explanation, no markdown fences — just the raw JSON object."
+                )
+                sweep_resp = await llm.ainvoke(sweep_prompt)
+                sweep_text = sweep_resp.content if hasattr(sweep_resp, "content") else str(sweep_resp)
+                sweep_map = extract_category_map(sweep_text)
+
+                if sweep_map:
+                    sweep_plan = build_move_plan(folder_path, sweep_map)
+                    sweep_count = len(sweep_plan)
+                    print(f"[Sweep: moving {sweep_count} file(s) into existing categories...]")
+                    try:
+                        sweep_result = await organize_tool.ainvoke(
+                            {"move_plan": json.dumps(sweep_plan)}
+                        )
+                        print(sweep_result)
+                    except Exception as e:
+                        print(f"[Sweep error: {e}]")
+                else:
+                    # Fallback: put everything into "Other"
+                    print("[Sweep: LLM could not categorize leftovers, moving to 'Other'...]")
+                    fallback_map = {"Other": leftover}
+                    fallback_plan = build_move_plan(folder_path, fallback_map)
+                    try:
+                        sweep_result = await organize_tool.ainvoke(
+                            {"move_plan": json.dumps(fallback_plan)}
+                        )
+                        print(sweep_result)
+                    except Exception as e:
+                        print(f"[Sweep error: {e}]")
+
+                # Final check
+                final_leftover = [f.name for f in Path(folder_path).iterdir() if f.is_file()]
+                if final_leftover:
+                    print(f"\n[Warning: {len(final_leftover)} file(s) could not be moved: {', '.join(final_leftover[:10])}]")
+                else:
+                    print("\n[Sweep complete — no files left at top level.]")
+
             print("\nDone! Your files have been organized.")
             break
         else:
