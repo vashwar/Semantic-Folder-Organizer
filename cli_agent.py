@@ -2,6 +2,7 @@ import asyncio
 import json
 import re
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -178,6 +179,57 @@ def merge_category_maps(maps: list[dict[str, list[str]]]) -> dict[str, list[str]
     return merged
 
 
+IMAGE_EXTENSIONS = {
+    '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff', '.tif',
+    '.heic', '.heif', '.ico', '.raw', '.cr2', '.nef', '.arw', '.svg',
+}
+
+EXIF_DATE_TAG = 36867  # DateTimeOriginal
+EXIF_DATE_FALLBACK = 306  # DateTime
+
+
+def _get_image_date(file_path: Path) -> datetime | None:
+    """Extract the date taken from EXIF metadata, falling back to filesystem mtime."""
+    try:
+        from PIL import Image
+        from PIL.ExifTags import Base as ExifBase
+
+        with Image.open(file_path) as img:
+            exif = img.getexif()
+            if exif:
+                date_str = exif.get(EXIF_DATE_TAG) or exif.get(EXIF_DATE_FALLBACK)
+                if date_str:
+                    return datetime.strptime(date_str, "%Y:%m:%d %H:%M:%S")
+    except Exception:
+        pass
+    # Fallback to filesystem modification time
+    if file_path.exists():
+        return datetime.fromtimestamp(file_path.stat().st_mtime)
+    return None
+
+
+def reorganize_images_by_date(folder_path: str, category_map: dict[str, list[str]]) -> dict[str, list[str]]:
+    """Pull image files out of LLM categories and reassign them to Mon-YYYY date folders."""
+    folder = Path(folder_path)
+    new_map: dict[str, list[str]] = {}
+
+    for category, filenames in category_map.items():
+        for filename in filenames:
+            ext = Path(filename).suffix.lower()
+            if ext in IMAGE_EXTENSIONS:
+                file_path = folder / filename
+                dt = _get_image_date(file_path)
+                if dt:
+                    date_folder = dt.strftime("%b-%Y")  # e.g. "Mar-2025"
+                else:
+                    date_folder = "Pictures"
+                new_map.setdefault(date_folder, []).append(filename)
+            else:
+                new_map.setdefault(category, []).append(filename)
+
+    return new_map
+
+
 def _build_batch_prompt(file_data: str, existing_categories: list[str] | None = None) -> str:
     """Build the prompt sent to the LLM for a single batch."""
     prompt = (
@@ -263,6 +315,7 @@ async def process_large_folder(
     # Merge all batch maps and catch any files the LLM missed
     merged = merge_category_maps(all_maps)
     merged = ensure_all_files_categorized(folder_path, merged)
+    merged = reorganize_images_by_date(folder_path, merged)
     plan = build_move_plan(folder_path, merged)
     return merged, plan
 
@@ -380,6 +433,7 @@ async def run_agent():
         category_map = extract_category_map(last_message.content)
         if category_map:
             category_map = ensure_all_files_categorized(folder_path, category_map)
+            category_map = reorganize_images_by_date(folder_path, category_map)
             plan = build_move_plan(folder_path, category_map)
             total_files = sum(len(v) for v in category_map.values())
             print(f"\n[Plan: {total_files} files into {len(category_map)} categories]")
@@ -396,6 +450,7 @@ async def run_agent():
             category_map = extract_category_map(last_message.content)
             if category_map:
                 category_map = ensure_all_files_categorized(folder_path, category_map)
+                category_map = reorganize_images_by_date(folder_path, category_map)
                 plan = build_move_plan(folder_path, category_map)
                 total_files = sum(len(v) for v in category_map.values())
                 print(f"[Plan: {total_files} files into {len(category_map)} categories]")
@@ -458,6 +513,7 @@ async def run_agent():
                 sweep_map = extract_category_map(sweep_text)
 
                 if sweep_map:
+                    sweep_map = reorganize_images_by_date(folder_path, sweep_map)
                     sweep_plan = build_move_plan(folder_path, sweep_map)
                     sweep_count = len(sweep_plan)
                     print(f"[Sweep: moving {sweep_count} file(s) into existing categories...]")
@@ -472,6 +528,7 @@ async def run_agent():
                     # Fallback: put everything into "Other"
                     print("[Sweep: LLM could not categorize leftovers, moving to 'Other'...]")
                     fallback_map = {"Other": leftover}
+                    fallback_map = reorganize_images_by_date(folder_path, fallback_map)
                     fallback_plan = build_move_plan(folder_path, fallback_map)
                     try:
                         sweep_result = await organize_tool.ainvoke(
@@ -511,6 +568,7 @@ async def run_agent():
                 new_map = extract_category_map(revision_text)
                 if new_map:
                     category_map = ensure_all_files_categorized(folder_path, new_map)
+                    category_map = reorganize_images_by_date(folder_path, category_map)
                     plan = build_move_plan(folder_path, category_map)
                     total_files = sum(len(v) for v in category_map.values())
                     print("=" * 60)
@@ -551,6 +609,7 @@ async def run_agent():
                 new_map = extract_category_map(last_message.content)
                 if new_map:
                     category_map = ensure_all_files_categorized(folder_path, new_map)
+                    category_map = reorganize_images_by_date(folder_path, category_map)
                     plan = build_move_plan(folder_path, category_map)
                     total_files = sum(len(v) for v in category_map.values())
                     print(f"\n[Updated plan: {total_files} files into {len(category_map)} categories]")
@@ -565,6 +624,7 @@ async def run_agent():
                     new_map = extract_category_map(messages[-1].content)
                     if new_map:
                         category_map = ensure_all_files_categorized(folder_path, new_map)
+                        category_map = reorganize_images_by_date(folder_path, category_map)
                         plan = build_move_plan(folder_path, category_map)
                         total_files = sum(len(v) for v in category_map.values())
                         print(f"[Updated plan: {total_files} files into {len(category_map)} categories]")

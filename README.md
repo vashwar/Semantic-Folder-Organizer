@@ -7,9 +7,10 @@ A CLI tool that uses the Gemini API to organize files based on their actual cont
 1. You provide a folder path
 2. The tool scans all files and reads content previews (.txt, .csv, .pdf)
 3. Gemini analyzes the content and proposes category-based subfolders
-4. You review the plan, approve it, or give feedback to revise
-5. Files are moved into the new folder structure
-6. A post-move sweep catches any leftover files and sorts them into existing categories
+4. Image files are automatically sorted into date-based folders (e.g. `Mar-2025`) using EXIF metadata
+5. You review the plan, approve it, or give feedback to revise
+6. Files are moved into the new folder structure
+7. A post-move sweep catches any leftover files and sorts them into existing categories
 
 **Large folders (200+ files)** are automatically processed in batches — each batch is sent to the LLM separately, and the results are merged into a single plan. Earlier batch categories are carried forward so naming stays consistent across batches.
 
@@ -135,17 +136,19 @@ You can provide feedback instead of approving to refine the categories:
 
 The agent will revise the plan and ask for approval again.
 
-## Supported File Types for Content Analysis
+## Supported File Types
 
 | Type | Method |
 |---|---|
-| `.txt`, `.csv` | Reads first 1000 characters |
-| `.pdf` | Extracts text from first page (up to 1000 chars) |
+| `.txt`, `.csv` | Reads first 1000 characters for content analysis |
+| `.pdf` | Extracts text from first page (up to 1000 chars) for content analysis |
+| Images (`.jpg`, `.png`, `.heic`, etc.) | Sorted into `Mon-YYYY` date folders using EXIF `DateTimeOriginal` (falls back to file modification time) |
 | All other files | Categorized by filename and extension only |
 
 ## Key Features
 
 - **Semantic categorization** — groups files by meaning/content, not just extension
+- **Image date sorting** — images are automatically organized into `Mon-YYYY` folders based on EXIF data
 - **Batch processing** — handles large folders (1800+ files) by splitting into batches of 200
 - **Category consistency** — earlier batch categories are primed into later batches so names stay uniform
 - **Post-move sweep** — re-scans after organizing and moves any leftover files into existing categories
